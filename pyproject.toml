@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flycut-linux"
+version = "0.1.0"
+description = "A translucent clipboard history for KDE Wayland"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["PySide6>=6.8", "dbus-python>=1.3", "PyGObject>=3.46"]
+
+[project.urls]
+Homepage = "https://github.com/ov1d1u/flycut-linux"
+Repository = "https://github.com/ov1d1u/flycut-linux"
+Issues = "https://github.com/ov1d1u/flycut-linux/issues"
+
+[project.scripts]
+flycut-linux = "flycut_linux.app:main"
+
+[tool.setuptools.packages.find]
+include = ["flycut_linux*"]
+
+[tool.setuptools.package-data]
+flycut_linux = ["*.svg"]

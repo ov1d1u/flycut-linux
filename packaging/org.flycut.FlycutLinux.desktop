@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Flycut Linux
+Comment=Transparent clipboard history for KDE Wayland
+Exec=flycut-linux --show
+Icon=flycut-linux
+Terminal=false
+Categories=Utility;Qt;
+StartupNotify=true
+StartupWMClass=org.flycut.FlycutLinux
+Actions=Settings;
+
+[Desktop Action Settings]
+Name=Settings
+Exec=flycut-linux --settings
