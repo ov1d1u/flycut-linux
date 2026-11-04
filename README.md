@@ -1,8 +1,29 @@
 # Flycut Linux
 
-A small clipboard manager for **KDE Plasma Wayland**, with Flycut's translucent,
-single-clipping preview. The macOS application is independent and unchanged.
-Text and image history stays on your machine. No network services are used.
+A small clipboard manager for **KDE Plasma Wayland**, with a translucent,
+single-clipping history preview. Text and image history stays on your machine.
+No network services are used.
+
+Flycut Linux is inspired by [Flycut](https://github.com/TermiT/Flycut), the
+macOS clipboard manager (itself based on
+[Jumpcut](https://github.com/snark/jumpcut)). It is a separate Python/Qt
+application written for Wayland and shares no code with the macOS app.
+
+## Project layout
+
+| Path | Contents |
+|------|----------|
+| `flycut_linux/app.py` | Entry point, tray, single-instance socket and focus handling |
+| `flycut_linux/ui.py` | History preview and settings windows |
+| `flycut_linux/capture.py` | `wl-paste` child that frames each copied entry |
+| `flycut_linux/storage.py` | Private SQLite history, JSON settings and login autostart |
+| `flycut_linux/portal.py` | GlobalShortcuts portal client for the history hotkey |
+| `flycut_linux/processes.py` | Clipboard watcher and paste sequencing (`wl-copy`, `ydotool`) |
+| `flycut_linux/blur.py` | Optional KWin background blur through KWindowSystem |
+| `flycut_linux/flycut-linux.svg` | Application icon |
+| `packaging/` | Desktop launcher (`org.flycut.FlycutLinux.desktop`) |
+| `tests/` | Unit tests and private-bus integration scripts |
+| `PKGBUILD`, `pyproject.toml` | Arch package recipe and Python package metadata |
 
 ## Arch Linux / CachyOS installation
 
@@ -10,7 +31,6 @@ From the repository checkout:
 
 ```sh
 sudo pacman -S --needed base-devel python-build python-installer python-setuptools python-wheel
-cd linux
 makepkg -si
 flycut-linux --settings
 ```
@@ -32,7 +52,6 @@ on the Plasma 6.8 desktop used during development.
 For source development with distro-installed dependencies:
 
 ```sh
-cd linux
 python -m flycut_linux.app --settings
 QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests -v
 # Optional private-bus portal integration (never uses your desktop portal):
@@ -95,7 +114,7 @@ Settings also reports daemon connectivity and required command availability.
   instance through a private local socket.
 
 The preview is translucent and, where the compositor supports it, blurs what
-is behind it (like the macOS bezel). On KDE this uses KWin's Blur effect through
+is behind it. On KDE this uses KWin's Blur effect through
 KWindowSystem, so the effect must be enabled in System Settings → Desktop
 Effects. Blur is skipped automatically on other compositors, when KWindowSystem
 is missing, or when PySide6 bundles its own Qt (pip wheels); the preview then
