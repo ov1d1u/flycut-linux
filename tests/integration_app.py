@@ -17,6 +17,10 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtTest import QTest
 from PySide6.QtCore import Qt
 from flycut_linux.app import Application
+from flycut_linux.processes import PASTE_KEYS, typing_events
+from integration_portal import take
+
+PASTE = [list(event) for event in PASTE_KEYS]
 
 
 def until(app, predicate, timeout=5):
@@ -47,7 +51,6 @@ def main():
                          "subprocess.run(sys.argv[4:],input=data,env=dict(os.environ,CLIPBOARD_STATE='data'),check=True)\n"
                          "time.sleep(60)\n"),
             "wl-copy": "import os,sys,pathlib,json\nroot=pathlib.Path(os.environ['FLYCUT_TEST_ROOT'])\n(root/'copied-args').write_text(json.dumps(sys.argv[1:]))\n(root/'copied').write_bytes(sys.stdin.buffer.read())\n",
-            "ydotool": "import os,sys,pathlib,json\nroot=pathlib.Path(os.environ['FLYCUT_TEST_ROOT'])\nif sys.argv[1]=='key': (root/'keys').write_text(json.dumps(sys.argv[1:]))\nif sys.argv[1]=='type':\n (root/'typed-args').write_text(json.dumps(sys.argv[1:]))\n (root/'typed').write_bytes(sys.stdin.buffer.read())\n",
         }
         for name, script in scripts.items():
             path = commands / name
@@ -69,11 +72,14 @@ def main():
             assert controller.history.entries()[0][1] == payload
             controller.show_history()
             QTest.keyClick(controller.preview, Qt.Key_Return)
-            until(app, lambda: (root / "keys").exists())
+            until(app, lambda: (root / "copied").exists() and not controller.paster.busy)
             assert (root / "copied").read_bytes() == payload.encode()
-            assert json.loads((root / "keys").read_text()) == ["key", "42:1", "110:1", "110:0", "42:0"]
             assert not controller.preview.isVisible()
-            until(app, lambda: not controller.paster.busy)
+            state = take()
+            assert state["events"] == PASTE, state
+            assert state["selects"] == [""], state
+            assert (root / "config/flycut-linux/remote-desktop-token").read_text() == "token-1"
+            assert "Paste permission: granted" in controller.diagnostics()
             client = QLocalSocket()
             client.connectToServer(name)
             assert client.waitForConnected(1000)
@@ -93,9 +99,8 @@ def main():
             assert controller.settings.values["type_content"]
             controller.show_history()
             QTest.keyClick(controller.preview, Qt.Key_Return)
-            until(app, lambda: (root / "typed").exists() and not controller.paster.busy)
-            assert (root / "typed").read_bytes() == payload.encode()
-            assert json.loads((root / "typed-args").read_text()) == ["type", "--key-delay", "0", "--key-hold", "0", "--file", "-", "--escape", "0"]
+            until(app, lambda: not controller.paster.busy)
+            assert take()["events"] == [list(event) for event in typing_events(payload)]
             # Images: captured by the second watcher, then pasted with keys even in typing mode.
             from PySide6.QtGui import QColor, QImage
             from flycut_linux.storage import History, ImageClip
@@ -103,7 +108,6 @@ def main():
             image.fill(QColor(30, 200, 30))
             assert image.save(str(root / "image.png"))
             png = (root / "image.png").read_bytes()
-            (root / "keys").unlink()
             controller.image_watcher.stop()
             controller.image_watcher.start()
             until(app, lambda: isinstance(controller.history.entries()[0][1], ImageClip))
@@ -111,7 +115,8 @@ def main():
             controller.show_history()
             assert "PNG image · 64×48" in controller.preview.counter.text()
             QTest.keyClick(controller.preview, Qt.Key_Return)
-            until(app, lambda: (root / "keys").exists() and not controller.paster.busy)
+            until(app, lambda: not controller.paster.busy)
+            assert take()["events"] == PASTE
             assert (root / "copied").read_bytes() == png
             assert json.loads((root / "copied-args").read_text()) == ["--type", "image/png"]
             controller.pause.setChecked(True)
@@ -121,7 +126,12 @@ def main():
             controller.history = History()
             assert controller.history.entries()[0][1].load() == png
             assert controller.history.entries()[1][1] == payload
-            print("PASS: full app capture, text and image copy/paste/type subprocesses, selection/release, IPC, settings, autostart, pause, persistence and shutdown")
+            # A restarted app reuses the saved permission instead of asking again.
+            assert controller.settings.restore_token() == "token-1"
+            controller.reset_paste_permission()
+            assert controller.settings.restore_token() == ""
+            assert "Paste permission: not requested yet" in controller.diagnostics()
+            print("PASS: full app capture, text and image copy, portal paste/type, selection/release, IPC, settings, autostart, pause, persistence and shutdown")
         finally:
             if controller:
                 controller.shutdown()

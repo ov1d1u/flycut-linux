@@ -243,6 +243,7 @@ class Preview(QWidget):
 class Preferences(QDialog):
     saved = Signal(dict)
     configure_shortcut = Signal()
+    reset_permission = Signal()
 
     def __init__(self, values, binding, diagnostics):
         super().__init__()
@@ -273,8 +274,8 @@ class Preferences(QDialog):
         self.layout.addRow(self.auto)
         self.type_content = QCheckBox("Type clipboard content")
         self.type_content.setChecked(values["type_content"])
-        self.type_content.setToolTip("Use ydotool type instead of Shift+Insert. Typing depends on ydotool's keyboard-layout and character support. "
-                                     "Images are always pasted with Shift+Insert.")
+        self.type_content.setToolTip("Type the text instead of pressing Shift+Insert. Typing uses your active keyboard layout; "
+                                     "characters that layout cannot produce may be skipped. Images are always pasted with Shift+Insert.")
         self.layout.addRow(self.type_content)
         self.capture_images = QCheckBox("Save copied images")
         self.capture_images.setChecked(values["capture_images"])
@@ -285,6 +286,10 @@ class Preferences(QDialog):
         self.delay.setSuffix(" ms")
         self.delay.setValue(values["paste_delay"])
         self.layout.addRow("Delay after closing preview", self.delay)
+        reset = QPushButton("Reset paste permission")
+        reset.setToolTip("Forget KDE's saved keyboard permission. Flycut asks again on the next automatic paste.")
+        reset.clicked.connect(self.reset_permission)
+        self.layout.addRow("", reset)
         self.autostart = QCheckBox("Start Flycut when I log in")
         self.autostart.setChecked(values["autostart"])
         self.layout.addRow(self.autostart)

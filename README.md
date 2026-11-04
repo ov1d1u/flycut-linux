@@ -17,8 +17,8 @@ application written for Wayland and shares no code with the macOS app.
 | `flycut_linux/ui.py` | History preview and settings windows |
 | `flycut_linux/capture.py` | `wl-paste` child that frames each copied entry |
 | `flycut_linux/storage.py` | Private SQLite history, JSON settings and login autostart |
-| `flycut_linux/portal.py` | GlobalShortcuts portal client for the history hotkey |
-| `flycut_linux/processes.py` | Clipboard watcher and paste sequencing (`wl-copy`, `ydotool`) |
+| `flycut_linux/portal.py` | GlobalShortcuts (history hotkey) and RemoteDesktop (paste keys) portal clients |
+| `flycut_linux/processes.py` | Clipboard watcher and paste sequencing (`wl-copy`) |
 | `flycut_linux/blur.py` | Optional KWin background blur through KWindowSystem |
 | `flycut_linux/flycut-linux.svg` | Application icon |
 | `packaging/` | Desktop launcher (`org.flycut.FlycutLinux.desktop`) |
@@ -42,11 +42,12 @@ flycut-linux-0.1.0-8-any.pkg.tar.zst`. This is a checkout-local PKGBUILD, not an
 AUR source package.
 
 Runtime dependencies: Python 3.11+, PySide6, Qt's Wayland plugin, dbus-python,
-PyGObject, **wl-clipboard 2.3+**, ydotool, xdg-desktop-portal and its KDE backend.
+PyGObject, **wl-clipboard 2.3+**, xdg-desktop-portal and its KDE backend.
 Optional: KWindowSystem (KF6) for background blur, already present on Plasma.
 The application forces Qt's native Wayland backend; it does not use X11 or
-XWayland. KDE must expose the data-control protocol and GlobalShortcuts portal
-version 2 for capture and the shortcut editor respectively. These are available
+XWayland. KDE must expose the data-control protocol, GlobalShortcuts portal
+version 2 and the RemoteDesktop portal for capture, the shortcut editor and
+automatic paste respectively. These are available
 on the Plasma 6.8 desktop used during development.
 
 For source development with distro-installed dependencies:
@@ -63,27 +64,20 @@ Install the package once before testing global shortcuts from source: the
 desktop portal needs the installed `org.flycut.FlycutLinux.desktop` launcher
 to identify the application.
 
-## ydotool setup
+## Paste permission
 
-`ydotoold` must already be running and allowed to access `/dev/uinput`. Flycut
-runs as your regular user and never changes device permissions or starts a
-privileged service. On Arch, inspect the packaged user service:
+Automatic paste sends keys through KDE's RemoteDesktop portal, which needs no
+daemon or `/dev/uinput` access. The first automatic paste asks KDE for
+keyboard control and KDE shows a permission prompt once. Flycut asks for
+the keyboard only (no pointer or screen). After you allow it, KDE returns a
+restore token that Flycut keeps in its private config directory, so later
+sessions and restarts don't ask again. If you deny the prompt, the entry stays
+copied and the next selection asks again.
 
-```sh
-systemctl --user cat ydotool.service
-systemctl --user enable --now ydotool.service
-systemctl --user status ydotool.service
-```
-
-If it fails to open `/dev/uinput`, follow your distribution's device-access
-policy for your user, then restart the service. Do not make the device or daemon
-socket world-writable. Service changes are your explicit setup step, separate
-from enabling Flycut's login autostart.
-
-The default client socket is `$XDG_RUNTIME_DIR/.ydotool_socket`. For a daemon
-using another path, export `YDOTOOL_SOCKET` into the graphical session before
-starting Flycut. `ydotool debug` checks connectivity without sending keys.
-Settings also reports daemon connectivity and required command availability.
+**Settings → Reset paste permission** forgets the saved token so KDE asks
+again. Settings → Status shows the current permission state. If you used
+ydotool with an earlier version, you can disable its service
+(`systemctl --user disable --now ydotool.service`); Flycut no longer uses it.
 
 ## Use
 
@@ -97,11 +91,11 @@ Settings also reports daemon connectivity and required command availability.
   or double-click selects an entry; Delete removes it; Escape cancels.
   Switching to another window dismisses history and cancels pending insertion.
 - Selection copies the exact text, waits for selection keys/buttons to be
-  released, closes the preview, and sends Shift+Insert through ydotool after 150 ms.
-  The delay is configurable. Enable **Type clipboard content** to use
-  `ydotool type` instead of Shift+Insert, or disable automatic insertion to copy only.
-  Typing uses zero key delay and zero hold time for maximum speed; the delay
-  after closing the preview still allows focus to return safely.
+  released, closes the preview, and sends Shift+Insert through the RemoteDesktop
+  portal after 150 ms. The delay is configurable. Enable **Type clipboard content**
+  to type the text instead of pressing Shift+Insert, or disable automatic insertion
+  to copy only. Keys are sent without intentional delays; the delay after closing
+  the preview still allows focus to return safely.
   The selected text stays on the clipboard.
 - Copied images appear in history as a scaled preview with their format,
   dimensions and size. Selecting one puts the original image back on the
@@ -123,10 +117,9 @@ in Settings, or set `FLYCUT_NO_BLUR=1`. Settings → Status shows whether blur i
 available. Wayland
 lets the compositor choose the final placement; the app requests a centered
 500×320 window. Automatic pasting relies on KDE restoring the previously focused
-app after the preview closes. In paste mode, targets must support Shift+Insert. Typing mode sends the text through
-ydotool's keyboard simulation; character support and the resulting text depend
-on ydotool and the active keyboard layout (ydotool 1.0.4 uses a US ASCII key map).
-Use paste mode for Unicode text. There is no per-application mode detection. If focus remains inside Flycut,
+app after the preview closes. In paste mode, targets must support Shift+Insert. Typing mode sends each character as a keysym, which KDE maps through your
+active keyboard layout; characters that layout cannot produce may be skipped.
+Use paste mode for arbitrary Unicode text. There is no per-application mode detection. If focus remains inside Flycut,
 input is held back and eventually cancelled. Do not switch target windows while
 a paste is pending.
 
@@ -143,6 +136,7 @@ Primary/middle-click selection is not tracked.
 
 - History: `${XDG_DATA_HOME:-~/.local/share}/flycut-linux/history.sqlite3`
 - Settings: `${XDG_CONFIG_HOME:-~/.config}/flycut-linux/settings.json`
+- Paste permission token: `${XDG_CONFIG_HOME:-~/.config}/flycut-linux/remote-desktop-token`
 - Login entry: `${XDG_CONFIG_HOME:-~/.config}/autostart/org.flycut.FlycutLinux.desktop`
 
 Directories and saved history/settings are private to your user. History is
@@ -161,10 +155,10 @@ permanently discard them.
 
 The automated suite covers exact capture framing, sensitive/binary/oversized
 input, image capture, preview and paste, history upgrades, private persistent storage, deduplication and history limits, settings
-and autostart, preview navigation, and paste sequencing with mocked processes.
-The optional integration scripts use a private bus and fake portal; the full
-app script also substitutes clipboard/input executables and uses temporary
-history and settings. They never read the desktop clipboard or send real keys.
+and autostart, preview navigation, and paste sequencing with a mocked keyboard.
+The optional integration scripts use a private bus and fake GlobalShortcuts and
+RemoteDesktop portals; the full app script also substitutes clipboard executables
+and uses temporary history and settings. They never read the desktop clipboard or send real keys.
 
 For desktop acceptance, verify hotkey approval/rebinding, translucency with and
 without blur, capture from native Wayland applications, focus restoration and paste
@@ -173,5 +167,5 @@ an image-aware app, tray controls, restart persistence and login
 autostart. Use disposable text and a test editor for paste checks.
 
 Integration references: [GlobalShortcuts portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html),
-[wl-clipboard](https://github.com/bugaevc/wl-clipboard),
-[ydotool](https://github.com/ReimuNotMoe/ydotool).
+[RemoteDesktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html),
+[wl-clipboard](https://github.com/bugaevc/wl-clipboard).

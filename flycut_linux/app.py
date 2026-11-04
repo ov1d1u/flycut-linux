@@ -6,12 +6,12 @@ from pathlib import Path
 import shutil
 import sys
 
-from PySide6.QtCore import QEvent, QObject, QLockFile, QProcess, QStandardPaths, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QLockFile, QStandardPaths, Qt, QTimer
 from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 from . import blur
-from .portal import Shortcuts
+from .portal import PortalThread, RemoteKeyboard, Shortcuts
 from .processes import Paster, Watcher
 from .storage import History, ImageClip, Settings
 from .ui import Preferences, Preview
@@ -56,8 +56,14 @@ class Application(QObject):
         self.preview.refresh(self.history.entries())
         self.input = InputState(self)
         qt.installEventFilter(self.input)
+        self.portal = PortalThread()
+        token = self.settings.restore_token()
+        self.paste_status = "permission saved" if token else "not requested yet"
+        self.keyboard = RemoteKeyboard(token, self, portal=self.portal)
+        self.keyboard.status.connect(self.update_paste_status)
+        self.keyboard.token.connect(self.save_restore_token)
         self.paster = Paster(self.preview.hide, self.focus_returned, self,
-                             ready_to_hide=self.input.released)
+                             ready_to_hide=self.input.released, keyboard=self.keyboard)
         self.paster.error.connect(self.report)
         self.preview.chosen.connect(lambda item: self.paster.select(item, self.settings.values))
         self.preview.dismissed.connect(self.paster.cancel)
@@ -68,7 +74,7 @@ class Application(QObject):
         for watcher in (self.watcher, self.image_watcher):
             watcher.captured.connect(self.capture)
             watcher.error.connect(self.report)
-        self.shortcuts = Shortcuts(self)
+        self.shortcuts = Shortcuts(self, portal=self.portal)
         self.shortcuts.activated.connect(self.shortcut)
         self.shortcuts.released.connect(self.shortcut_released)
         self.shortcuts.binding.connect(self.update_binding)
@@ -76,13 +82,6 @@ class Application(QObject):
         self.binding = "Connecting to KDE…"
         self.last_error = ""
         self.preferences = None
-        self.daemon_status = "not checked"
-        self.daemon_probe = QProcess(self)
-        self.daemon_probe.finished.connect(self.daemon_checked)
-        self.daemon_probe.errorOccurred.connect(lambda _: self.daemon_checked(1, QProcess.CrashExit))
-        self.daemon_timeout = QTimer(self)
-        self.daemon_timeout.setSingleShot(True)
-        self.daemon_timeout.timeout.connect(self.daemon_probe.kill)
         self.clients = set()
         self.tray = QSystemTrayIcon(QIcon(str(Path(__file__).with_name("flycut-linux.svg"))), self)
         self.tray.setToolTip("Flycut Linux — clipboard history")
@@ -101,7 +100,7 @@ class Application(QObject):
         self.tray.show()
         self.server.newConnection.connect(self.connection)
         qt.aboutToQuit.connect(self.shutdown)
-        self.shortcuts.start()
+        self.portal.start()
         self.start_watchers()
         if self.settings.warning:
             QTimer.singleShot(0, lambda: self.report(self.settings.warning))
@@ -179,22 +178,30 @@ class Application(QObject):
             self.preferences.binding_label.setText(binding)
 
     def diagnostics(self):
-        lines = [f"{name}: {'found' if shutil.which(name) else 'MISSING'}" for name in ("wl-copy", "wl-paste", "ydotool")]
-        path = os.environ.get("YDOTOOL_SOCKET", os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), ".ydotool_socket"))
-        lines.append(f"ydotoold: {self.daemon_status} ({path})")
+        lines = [f"{name}: {'found' if shutil.which(name) else 'MISSING'}" for name in ("wl-copy", "wl-paste")]
+        lines.append("Paste permission: " + self.paste_status)
         lines.append("KDE shortcut: " + self.binding)
         lines.append("Background blur: " + blur.status())
         if self.last_error:
             lines.append(self.last_error)
         return "\n".join(lines)
 
-    def daemon_checked(self, code, status):
-        self.daemon_timeout.stop()
-        self.daemon_probe.readAllStandardOutput()
-        self.daemon_probe.readAllStandardError()
-        self.daemon_status = "connected" if code == 0 and status == QProcess.NormalExit else "unavailable; check service and socket permissions"
+    def update_paste_status(self, status):
+        self.paste_status = status
         if self.preferences:
             self.preferences.diagnostics.setText(self.diagnostics())
+
+    def save_restore_token(self, token):
+        try:
+            self.settings.save_restore_token(token)
+        except OSError as exc:
+            self.report(f"Could not save paste permission: {exc}")
+
+    def reset_paste_permission(self):
+        self.paster.cancel()
+        self.keyboard.reset_permission()
+        self.save_restore_token("")
+        self.update_paste_status("not requested yet")
 
     def show_settings(self):
         self.paster.cancel()
@@ -203,12 +210,10 @@ class Application(QObject):
             self.preferences = Preferences(self.settings.values, self.binding, self.diagnostics())
             self.preferences.saved.connect(self.save_settings)
             self.preferences.configure_shortcut.connect(self.shortcuts.configure)
+            self.preferences.reset_permission.connect(self.reset_paste_permission)
             self.preferences.finished.connect(self.preferences_closed)
         self.preferences.diagnostics.setText(self.diagnostics())
         self.activate(self.preferences)
-        if self.daemon_probe.state() == QProcess.NotRunning:
-            self.daemon_timeout.start(2000)
-            self.daemon_probe.start("ydotool", ["debug"])
 
     def preferences_closed(self, _result):
         self.preferences.deleteLater()
@@ -279,9 +284,7 @@ class Application(QObject):
         self.paster.cancel()
         self.watcher.stop()
         self.image_watcher.stop()
-        self.shortcuts.stop()
-        self.daemon_probe.kill()
-        self.daemon_probe.waitForFinished(1000)
+        self.portal.stop()
         self.history.close()
         self.server.close()
         self.tray.hide()

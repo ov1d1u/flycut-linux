@@ -28,7 +28,76 @@ def server():
     class Session(dbus.service.Object):
         @dbus.service.method("org.freedesktop.portal.Session", in_signature="", out_signature="")
         def Close(self):
+            remote.closed.append(str(self._object_path))
+
+        @dbus.service.signal("org.freedesktop.portal.Session", signature="a{sv}")
+        def Closed(self, details):
             pass
+
+    remote_iface = "org.freedesktop.portal.RemoteDesktop"
+
+    class Remote(dbus.service.Object):
+        """Fake RemoteDesktop portal; records key events for the tests."""
+
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.count = 0
+            self.sessions = {}
+            self.events = []
+            self.selects = []
+            self.closed = []
+            self.deny = False
+
+        @dbus.service.method(remote_iface, in_signature="a{sv}", out_signature="o", sender_keyword="sender")
+        def CreateSession(self, options, sender):
+            self.count += 1
+            path = dbus.ObjectPath(f"/org/freedesktop/portal/desktop/session/test/remote{self.count}")
+            self.sessions[path] = Session(bus, path)
+            return portal.respond(sender, options, {"session_handle": dbus.String(path)})
+
+        @dbus.service.method(remote_iface, in_signature="oa{sv}", out_signature="o", sender_keyword="sender", message_keyword="message")
+        def SelectDevices(self, session, options, sender, message):
+            assert str(message.get_signature()) == "oa{sv}"
+            assert session in self.sessions
+            assert int(options["types"]) == 1 and int(options["persist_mode"]) == 2
+            self.selects.append(str(options.get("restore_token", "")))
+            return portal.respond(sender, options, {})
+
+        @dbus.service.method(remote_iface, in_signature="osa{sv}", out_signature="o", sender_keyword="sender")
+        def Start(self, session, parent, options, sender):
+            assert session in self.sessions
+            if self.deny:
+                return portal.respond(sender, options, {}, code=1)
+            return portal.respond(sender, options, {"devices": dbus.UInt32(1), "restore_token": f"token-{self.count}"})
+
+        @dbus.service.method(remote_iface, in_signature="oa{sv}iu", out_signature="", message_keyword="message")
+        def NotifyKeyboardKeycode(self, session, options, keycode, state, message):
+            assert str(message.get_signature()) == "oa{sv}iu"
+            assert session in self.sessions
+            self.events.append(["code", int(keycode), bool(state)])
+
+        @dbus.service.method(remote_iface, in_signature="oa{sv}iu", out_signature="", message_keyword="message")
+        def NotifyKeyboardKeysym(self, session, options, keysym, state, message):
+            assert str(message.get_signature()) == "oa{sv}iu"
+            assert session in self.sessions
+            self.events.append(["sym", int(keysym), bool(state)])
+
+        # Test-only controls.
+        @dbus.service.method("org.flycut.Test", in_signature="", out_signature="s")
+        def Take(self):
+            import json
+            result = json.dumps(dict(events=self.events, selects=self.selects, closed=self.closed))
+            self.events, self.selects, self.closed = [], [], []
+            return result
+
+        @dbus.service.method("org.flycut.Test", in_signature="b", out_signature="")
+        def Deny(self, deny):
+            self.deny = deny
+
+        @dbus.service.method("org.flycut.Test", in_signature="", out_signature="")
+        def EndSession(self):
+            path = max(self.sessions)
+            self.sessions.pop(path).Closed({})
 
     class Portal(dbus.service.Object):
         @dbus.service.method("org.freedesktop.host.portal.Registry", in_signature="sa{sv}", out_signature="", sender_keyword="sender")
@@ -36,12 +105,12 @@ def server():
             assert app_id == "org.flycut.FlycutLinux"
             registry.add(sender)
 
-        def respond(self, sender, options, results):
+        def respond(self, sender, options, results, code=0):
             assert sender in registry
             path = "/org/freedesktop/portal/desktop/request/" + sender[1:].replace(".", "_") + "/" + options["handle_token"]
             request = Request(bus, path)
             requests.append(request)
-            GLib.timeout_add(20, lambda: (request.Response(0, results), False)[1])
+            GLib.timeout_add(20, lambda: (request.Response(code, results), False)[1])
             return dbus.ObjectPath(path)
 
         @dbus.service.method(interface, in_signature="a{sv}", out_signature="o", sender_keyword="sender")
@@ -85,9 +154,74 @@ def server():
         def ShortcutsChanged(self, session, shortcuts):
             pass
 
-    portal = Portal(bus, "/org/freedesktop/portal/desktop")
+    class Desktop(Portal, Remote):
+        pass
+
+    portal = remote = Desktop(bus, "/org/freedesktop/portal/desktop")
     print("ready", flush=True)
     GLib.MainLoop().run()
+
+
+def wait(app, predicate, timeout=5):
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.005)
+    return predicate()
+
+
+def fake_state():
+    import dbus
+    proxy = dbus.SessionBus().get_object("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
+    return dbus.Interface(proxy, "org.flycut.Test")
+
+
+def take():
+    import json
+    return json.loads(fake_state().Take())
+
+
+def keyboard_checks(app):
+    from flycut_linux.portal import PortalThread, RemoteKeyboard
+    thread = PortalThread()
+    keyboard = RemoteKeyboard("saved-token", portal=thread)
+    sent, failed, statuses, tokens = [], [], [], []
+    keyboard.sent.connect(sent.append)
+    keyboard.failed.connect(lambda op, message: failed.append((op, message)))
+    keyboard.status.connect(statuses.append)
+    keyboard.token.connect(tokens.append)
+    thread.start()
+    assert wait(app, lambda: thread.loop is not None and thread.loop.is_running())
+    events = [("code", 42, True), ("code", 110, True), ("code", 110, False), ("code", 42, False)]
+    many = [("sym", 0x61 + i % 26, pressed) for i in range(150) for pressed in (True, False)]
+    keyboard.send(1, events)
+    assert wait(app, lambda: sent or failed), "no keyboard result"
+    assert sent == [1] and not failed, (sent, failed)
+    assert keyboard.ready and tokens == ["token-1"], tokens
+    keyboard.send(2, many)
+    assert wait(app, lambda: len(sent) == 2), sent
+    state = take()
+    assert state["selects"] == ["saved-token"], state
+    assert state["events"] == [list(e) for e in events + many], "events lost or reordered"
+    # KDE ending the session: the next send starts a new one with the new token.
+    fake_state().EndSession()
+    assert wait(app, lambda: not keyboard.ready)
+    keyboard.send(3, events)
+    assert wait(app, lambda: len(sent) == 3), sent
+    assert take()["selects"] == ["token-1"]
+    # Resetting forgets the token; a denied request reports failure and sends nothing.
+    keyboard.reset_permission()
+    assert wait(app, lambda: statuses[-1] == "not requested yet")
+    fake_state().Deny(True)
+    keyboard.send(4, events)
+    assert wait(app, lambda: failed), "denial not reported"
+    assert failed[0][0] == 4 and "permission" in failed[0][1], failed
+    assert statuses[-1] == "denied", statuses
+    state = take()
+    assert state["selects"] == [""] and state["events"] == [], state
+    fake_state().Deny(False)
+    thread.stop()
+    assert not thread.thread.is_alive()
 
 
 def client():
@@ -121,7 +255,9 @@ def client():
         assert bindings == ["Ctrl+Alt+V", "Meta+V"], bindings
         portal.stop()
         assert not portal.thread.is_alive()
-        print("PASS: portal registration, request framing, binding, token, release, rebinding and shutdown")
+        keyboard_checks(app)
+        print("PASS: portal registration, request framing, binding, token, release, rebinding, shutdown, "
+              "remote keyboard ordering, restore tokens, session loss, reset and denial")
     finally:
         process.terminate()
         process.wait(timeout=3)
