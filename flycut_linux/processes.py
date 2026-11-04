@@ -2,6 +2,7 @@
 import sys
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 from .capture import Decoder
+from .portal import keysym
 from .storage import MAX_BYTES, MAX_IMAGE_BYTES, ImageClip
 
 
@@ -61,18 +62,35 @@ class Watcher(QObject):
         self.process.waitForFinished(1000)
 
 
+SHIFT, INSERT = 42, 110  # evdev keycodes
+PASTE_KEYS = [("code", SHIFT, True), ("code", INSERT, True), ("code", INSERT, False), ("code", SHIFT, False)]
+# Allow time for KDE's one-time keyboard permission prompt.
+PERMISSION_WAIT = 120000
+
+
+def typing_events(text):
+    events = []
+    for character in text:
+        symbol = keysym(character)
+        events += [("sym", symbol, True), ("sym", symbol, False)]
+    return events
+
+
 class Paster(QObject):
     copied = Signal()
     done = Signal()
     error = Signal(str)
 
-    def __init__(self, hide, safe_to_paste, parent=None, ready_to_hide=lambda: True):
+    def __init__(self, hide, safe_to_paste, parent=None, ready_to_hide=lambda: True, keyboard=None):
         super().__init__(parent)
         self.hide = hide
         self.safe_to_paste = safe_to_paste
         self.ready_to_hide = ready_to_hide
+        self.keyboard = keyboard
+        if keyboard is not None:
+            keyboard.sent.connect(self.keys_sent)
+            keyboard.failed.connect(self.keys_failed)
         self.copy = None
-        self.keys = None
         self.operation = 0
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
@@ -89,11 +107,9 @@ class Paster(QObject):
             return False
         self.operation += 1
         operation = self.operation
-        for process in (self.copy, self.keys):
-            if process:
-                process.deleteLater()
+        if self.copy:
+            self.copy.deleteLater()
         self.copy = QProcess(self)
-        self.keys = QProcess(self)
 
         def current(callback):
             def dispatch(*args):
@@ -104,9 +120,6 @@ class Paster(QObject):
         self.copy.started.connect(current(self.write))
         self.copy.finished.connect(current(self.copy_finished))
         self.copy.errorOccurred.connect(current(lambda _: self.fail("Could not run wl-copy.")))
-        self.keys.started.connect(current(self.write_typing))
-        self.keys.finished.connect(current(self.keys_finished))
-        self.keys.errorOccurred.connect(current(lambda _: self.fail("Could not contact ydotoold. Check the service and socket permissions.")))
         self.busy = True
         self.options = dict(settings)
         if isinstance(item, ImageClip):
@@ -129,11 +142,6 @@ class Paster(QObject):
     def write(self):
         self.copy.write(self.data)
         self.copy.closeWriteChannel()
-
-    def write_typing(self):
-        if self.options.get("type_content", False):
-            self.keys.write(self.data)
-        self.keys.closeWriteChannel()
 
     def copy_finished(self, code, status):
         if not self.busy:
@@ -171,26 +179,29 @@ class Paster(QObject):
             else:
                 self.timer.start(50)
             return
-        if self.options.get("type_content", False):
-            # Stdin keeps text out of argv, avoids command-size limits, and
-            # preserves literal backslashes instead of interpreting escapes.
-            args = ["type", "--key-delay", "0", "--key-hold", "0",
-                    "--file", "-", "--escape", "0"]
-            # No intentional per-key delays. Still allow large entries time
-            # to traverse the daemon and compositor input pipeline.
-            self.timeout.start(5000 + len(self.data) * 100)
-        else:
-            args = ["key", "42:1", "110:1", "110:0", "42:0"]
-        self.stage = "keys"
-        self.keys.start("ydotool", args)
-
-    def keys_finished(self, code, status):
-        if not self.busy:
+        if self.keyboard is None:
+            self.fail("Automatic paste is unavailable; the entry remains copied.")
             return
-        if code != 0 or status != QProcess.NormalExit:
-            self.fail("ydotool could not insert text. Check ydotoold, YDOTOOL_SOCKET and /dev/uinput access; the entry remains copied.")
+        if self.options.get("type_content", False):
+            events = typing_events(self.data.decode("utf-8"))
+            # Allow large entries time to traverse the portal and compositor.
+            limit = 5000 + len(events) * 2
         else:
+            events = PASTE_KEYS
+            limit = 5000
+        if not self.keyboard.ready:
+            limit += PERMISSION_WAIT
+        self.timeout.start(limit)
+        self.stage = "keys"
+        self.keyboard.send(self.operation, events)
+
+    def keys_sent(self, operation):
+        if self.busy and operation == self.operation and self.stage == "keys":
             self.complete()
+
+    def keys_failed(self, operation, message):
+        if self.busy and operation == self.operation and self.stage == "keys":
+            self.fail(message)
 
     def complete(self):
         self.busy = False
@@ -200,16 +211,20 @@ class Paster(QObject):
         self.data = b""
         self.done.emit()
 
+    def stop_keys(self):
+        if self.stage == "keys" and self.keyboard is not None:
+            self.keyboard.cancel(self.operation)
+
     def fail(self, message):
         if not self.busy:
             return
+        self.stop_keys()
         self.complete()
         self.copy.kill()
-        self.keys.kill()
         self.error.emit(message)
 
     def cancel(self):
         if self.busy:
+            self.stop_keys()
             self.complete()
             self.copy.kill()
-            self.keys.kill()

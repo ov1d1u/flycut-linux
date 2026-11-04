@@ -84,6 +84,30 @@ class Settings:
             if os.path.exists(name):
                 os.unlink(name)
 
+    @property
+    def token_path(self):
+        return self.directory / "remote-desktop-token"
+
+    def restore_token(self):
+        """KDE's RemoteDesktop restore token; kept out of settings.json."""
+        try:
+            return self.token_path.read_text().strip()
+        except OSError:
+            return ""
+
+    def save_restore_token(self, token):
+        if not token:
+            self.token_path.unlink(missing_ok=True)
+            return
+        fd, name = tempfile.mkstemp(dir=self.directory)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                stream.write(token)
+            os.replace(name, self.token_path)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+
     def set_autostart(self, enabled):
         directory = xdg_path("XDG_CONFIG_HOME", ".config") / "autostart"
         directory.mkdir(parents=True, exist_ok=True)
