@@ -287,7 +287,7 @@ class PreviewTests(unittest.TestCase):
         preview.deleteLater()
 
     def test_blur_falls_back_quietly_without_support(self):
-        with patch.object(blur, "available", lambda: False):
+        with patch.object(blur, "_load", lambda: None):
             preview = Preview(blur_background=True)
             preview.show()
             self.assertFalse(preview.apply_blur())

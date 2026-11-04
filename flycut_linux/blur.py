@@ -77,9 +77,15 @@ def status():
 def set_blur(window, enabled, region=None):
     """Blur behind a top-level QWindow, limited to region when given.
 
-    Returns True when the request was sent to the compositor.
+    Returns True when the request was handed to KWindowSystem.
+
+    This deliberately does not check available(): on Wayland KWindowSystem
+    binds KWin's blur manager asynchronously, so right after startup it can
+    still report blur as unavailable. KWindowSystem remembers the request and
+    applies it once the manager becomes active; dropping it here would leave
+    the first presentation unblurred.
     """
-    if window is None or not available():
+    if window is None or _load() is None:
         return False
     region = region if region is not None else QRegion()
     try:

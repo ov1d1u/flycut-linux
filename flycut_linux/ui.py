@@ -31,6 +31,9 @@ class Preview(QWidget):
         self.resize(500, 320)
         self.opacity = opacity
         self.blur_background = blur_background
+        # Start KWindowSystem early so its blur manager is likely bound by
+        # the time the preview is first shown.
+        blur.available()
         self.rows = []
         self.selected_id = None
         self.index = 0
