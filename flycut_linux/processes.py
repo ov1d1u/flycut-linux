@@ -2,15 +2,16 @@
 import sys
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 from .capture import Decoder
-from .storage import MAX_BYTES
+from .storage import MAX_BYTES, MAX_IMAGE_BYTES, ImageClip
 
 
 class Watcher(QObject):
-    captured = Signal(str)
+    captured = Signal(object)  # str for text, ImageClip for images
     error = Signal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, mode="text"):
         super().__init__(parent)
+        self.mode = mode
         self.process = QProcess(self)
         self.decoder = Decoder()
         self.running = False
@@ -28,13 +29,13 @@ class Watcher(QObject):
         if self.process.state() != QProcess.NotRunning:
             return
         self.decoder = Decoder()
-        self.process.start("wl-paste", ["--type", "text", "--watch", sys.executable,
-                                       "-m", "flycut_linux.capture"])
+        self.process.start("wl-paste", ["--type", self.mode, "--watch", sys.executable,
+                                       "-m", "flycut_linux.capture", self.mode])
 
     def read(self):
         try:
-            for text in self.decoder.feed(bytes(self.process.readAllStandardOutput())):
-                self.captured.emit(text)
+            for item in self.decoder.feed(bytes(self.process.readAllStandardOutput())):
+                self.captured.emit(item)
         except ValueError:
             self.error.emit("Invalid clipboard capture stream; restarting watcher.")
             self.process.kill()
@@ -83,7 +84,7 @@ class Paster(QObject):
         self.waits = 0
         self.stage = "idle"
 
-    def select(self, text, settings):
+    def select(self, item, settings):
         if self.busy:
             return False
         self.operation += 1
@@ -107,15 +108,22 @@ class Paster(QObject):
         self.keys.finished.connect(current(self.keys_finished))
         self.keys.errorOccurred.connect(current(lambda _: self.fail("Could not contact ydotoold. Check the service and socket permissions.")))
         self.busy = True
-        self.data = text.encode("utf-8")
-        if not self.data or len(self.data) > MAX_BYTES:
-            self.fail("Clipboard entry is empty or exceeds 1 MiB.")
-            return False
         self.options = dict(settings)
+        if isinstance(item, ImageClip):
+            self.data = item.load()
+            mime, limit = item.mime, MAX_IMAGE_BYTES
+            # Images cannot be typed; always paste them with the key shortcut.
+            self.options["type_content"] = False
+        else:
+            self.data = item.encode("utf-8")
+            mime, limit = "text/plain;charset=utf-8", MAX_BYTES
+        if not self.data or len(self.data) > limit:
+            self.fail("Clipboard entry is empty or too large.")
+            return False
         self.waits = 0
         self.stage = "copying"
         self.timeout.start(5000)
-        self.copy.start("wl-copy", ["--type", "text/plain;charset=utf-8"])
+        self.copy.start("wl-copy", ["--type", mime])
         return True
 
     def write(self):

@@ -8,7 +8,20 @@ from PySide6.QtTest import QTest
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtWidgets import QApplication
 from flycut_linux.processes import Paster
-from flycut_linux.storage import DEFAULTS
+from flycut_linux.storage import DEFAULTS, ImageClip
+from PySide6.QtCore import QBuffer, QByteArray
+from PySide6.QtGui import QColor, QImage
+
+
+def png(width=40, height=30):
+    image = QImage(width, height, QImage.Format_RGB32)
+    image.fill(QColor(200, 30, 30))
+    data = QByteArray()
+    buffer = QBuffer(data)
+    buffer.open(QBuffer.WriteOnly)
+    image.save(buffer, "PNG")
+    return bytes(data)
+from flycut_linux import blur
 from flycut_linux.ui import Preview
 
 APP = QApplication.instance() or QApplication([])
@@ -123,6 +136,19 @@ class PasteTests(unittest.TestCase):
         self.assertEqual(self.paster.keys.payload, text.encode())
         self.assertGreater(self.paster.timeout.interval(), 5000)
 
+    def test_image_is_copied_with_its_type_and_pasted_not_typed(self):
+        data = png()
+        self.assertTrue(self.paster.select(ImageClip.of("image/png", data), dict(self.options, type_content=True)))
+        self.assertEqual(self.paster.copy.calls, [("wl-copy", ["--type", "image/png"])])
+        self.assertEqual(self.paster.copy.payload, data)
+        self.copied()
+        self.assertEqual(self.paster.keys.calls, [("ydotool", ["key", "42:1", "110:1", "110:0", "42:0"])])
+        self.assertEqual(self.paster.keys.payload, b"")
+
+    def test_text_copied_as_utf8_text(self):
+        self.paster.select("hello", self.options)
+        self.assertEqual(self.paster.copy.calls, [("wl-copy", ["--type", "text/plain;charset=utf-8"])])
+
     def test_missing_copy_and_daemon(self):
         self.paster.select("hello", self.options)
         self.paster.copy.errorOccurred.emit(QProcess.FailedToStart)
@@ -216,3 +242,56 @@ class PreviewTests(unittest.TestCase):
         QTest.keyClick(preview, Qt.Key_Escape)
         self.assertFalse(preview.isVisible())
         preview.deleteLater()
+
+    def test_image_preview_and_selection(self):
+        preview = Preview()
+        image = ImageClip.of("image/png", png(1200, 900))
+        preview.refresh([(2, image), (1, "text")])
+        preview.show()
+        spin(20)
+        self.assertTrue(preview.image.isVisible())
+        self.assertFalse(preview.text.isVisible())
+        self.assertIn("PNG image · 1200×900", preview.counter.text())
+        pixmap = preview.image.pixmap()
+        self.assertFalse(pixmap.isNull())
+        # Large images are scaled down to fit the panel.
+        self.assertLessEqual(pixmap.width() / pixmap.devicePixelRatio(), preview.image.width())
+        chosen = []
+        preview.chosen.connect(chosen.append)
+        QTest.keyClick(preview, Qt.Key_Return)
+        self.assertIs(chosen[0], image)
+        QTest.keyClick(preview, Qt.Key_Down)
+        self.assertTrue(preview.text.isVisible())
+        self.assertFalse(preview.image.isVisible())
+        self.assertEqual(preview.text.toPlainText(), "text")
+        preview.refresh([(3, ImageClip.of("image/png", b"\x89PNG\r\n\x1a\nbroken"))], reset=True)
+        self.assertEqual(preview.image.text(), "Image preview unavailable")
+        preview.hide()
+        preview.deleteLater()
+
+    def test_blur_requested_inside_rounded_panel_and_toggled(self):
+        calls = []
+        with patch("flycut_linux.ui.blur.set_blur", lambda window, on, region: calls.append((window, on, region)) or True):
+            preview = Preview(blur_background=True)
+            preview.show()
+            self.assertTrue(calls)
+            window, enabled, region = calls[-1]
+            self.assertIs(window, preview.windowHandle())
+            self.assertTrue(enabled)
+            # The rounded corners stay outside the blurred area.
+            self.assertFalse(region.contains(QPoint(0, 0)))
+            self.assertTrue(region.contains(preview.rect().center()))
+            preview.set_blur(False)
+            self.assertFalse(calls[-1][1])
+            preview.hide()
+        preview.deleteLater()
+
+    def test_blur_falls_back_quietly_without_support(self):
+        with patch.object(blur, "available", lambda: False):
+            preview = Preview(blur_background=True)
+            preview.show()
+            self.assertFalse(preview.apply_blur())
+            self.assertTrue(preview.isVisible())
+            preview.hide()
+        preview.deleteLater()
+        self.assertTrue(blur.status())

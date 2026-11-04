@@ -10,9 +10,10 @@ from PySide6.QtCore import QEvent, QObject, QLockFile, QProcess, QStandardPaths,
 from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
+from . import blur
 from .portal import Shortcuts
 from .processes import Paster, Watcher
-from .storage import History, Settings
+from .storage import History, ImageClip, Settings
 from .ui import Preferences, Preview
 
 APP_ID = "org.flycut.FlycutLinux"
@@ -51,20 +52,22 @@ class Application(QObject):
         self.server = server
         self.settings = Settings()
         self.history = History(limit=self.settings.values["history_limit"])
-        self.preview = Preview(self.settings.values["opacity"])
+        self.preview = Preview(self.settings.values["opacity"], self.settings.values["blur"])
         self.preview.refresh(self.history.entries())
         self.input = InputState(self)
         qt.installEventFilter(self.input)
         self.paster = Paster(self.preview.hide, self.focus_returned, self,
                              ready_to_hide=self.input.released)
         self.paster.error.connect(self.report)
-        self.preview.chosen.connect(lambda text: self.paster.select(text, self.settings.values))
+        self.preview.chosen.connect(lambda item: self.paster.select(item, self.settings.values))
         self.preview.dismissed.connect(self.paster.cancel)
         self.preview.remove.connect(self.remove)
         self.preview.settings_requested.connect(self.show_settings)
         self.watcher = Watcher(self)
-        self.watcher.captured.connect(self.capture)
-        self.watcher.error.connect(self.report)
+        self.image_watcher = Watcher(self, mode="image")
+        for watcher in (self.watcher, self.image_watcher):
+            watcher.captured.connect(self.capture)
+            watcher.error.connect(self.report)
         self.shortcuts = Shortcuts(self)
         self.shortcuts.activated.connect(self.shortcut)
         self.shortcuts.released.connect(self.shortcut_released)
@@ -99,7 +102,7 @@ class Application(QObject):
         self.server.newConnection.connect(self.connection)
         qt.aboutToQuit.connect(self.shutdown)
         self.shortcuts.start()
-        self.watcher.start()
+        self.start_watchers()
         if self.settings.warning:
             QTimer.singleShot(0, lambda: self.report(self.settings.warning))
 
@@ -136,9 +139,18 @@ class Application(QObject):
         if token:
             os.environ.pop("XDG_ACTIVATION_TOKEN", None)
 
-    def capture(self, text):
+    def start_watchers(self):
+        self.watcher.start()
+        if self.settings.values["capture_images"]:
+            self.image_watcher.start()
+        else:
+            self.image_watcher.stop()
+
+    def capture(self, item):
+        if isinstance(item, ImageClip) and not self.settings.values["capture_images"]:
+            return
         try:
-            if not self.pause.isChecked() and self.history.add(text):
+            if not self.pause.isChecked() and self.history.add(item):
                 self.preview.refresh(self.history.entries())
         except Exception as exc:
             self.report(f"Could not save clipboard history: {exc}")
@@ -150,8 +162,9 @@ class Application(QObject):
     def pause_capture(self, paused):
         if paused:
             self.watcher.stop()
+            self.image_watcher.stop()
         else:
-            self.watcher.start()
+            self.start_watchers()
         self.tray.setToolTip("Flycut Linux — capture paused" if paused else "Flycut Linux — clipboard history")
 
     def clear(self):
@@ -170,6 +183,7 @@ class Application(QObject):
         path = os.environ.get("YDOTOOL_SOCKET", os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), ".ydotool_socket"))
         lines.append(f"ydotoold: {self.daemon_status} ({path})")
         lines.append("KDE shortcut: " + self.binding)
+        lines.append("Background blur: " + blur.status())
         if self.last_error:
             lines.append(self.last_error)
         return "\n".join(lines)
@@ -212,7 +226,10 @@ class Application(QObject):
             self.report(f"Could not save settings: {exc}")
             return
         self.preview.opacity = values["opacity"]
+        self.preview.set_blur(values["blur"])
         self.preview.update()
+        if not self.pause.isChecked():
+            self.start_watchers()
         self.preview.refresh(self.history.entries())
         self.preferences.accept()
 
@@ -261,6 +278,7 @@ class Application(QObject):
     def shutdown(self):
         self.paster.cancel()
         self.watcher.stop()
+        self.image_watcher.stop()
         self.shortcuts.stop()
         self.daemon_probe.kill()
         self.daemon_probe.waitForFinished(1000)

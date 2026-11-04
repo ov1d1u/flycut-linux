@@ -1,23 +1,36 @@
 """Translucent single-entry bezel and regular settings window."""
 from PySide6.QtCore import QEvent, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPainterPath
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPixmap, QRegion
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                               QPlainTextEdit, QFormLayout, QSpinBox, QCheckBox, QSlider,
-                              QDialog, QDialogButtonBox)
+                              QDialog, QDialogButtonBox, QSizePolicy)
+
+from . import blur
+from .storage import ImageClip
+
+RADIUS = 18
+
+
+def file_size(size):
+    for unit in ("bytes", "KB", "MB"):
+        if size < 1024 or unit == "MB":
+            return f"{size:,} {unit}" if unit == "bytes" else f"{size:.1f} {unit}"
+        size /= 1024
 
 
 class Preview(QWidget):
-    chosen = Signal(str)
+    chosen = Signal(object)  # str for text, ImageClip for images
     remove = Signal(int)
     settings_requested = Signal()
     dismissed = Signal()
 
-    def __init__(self, opacity=82):
+    def __init__(self, opacity=82, blur_background=True):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle("Flycut Linux")
         self.resize(500, 320)
         self.opacity = opacity
+        self.blur_background = blur_background
         self.rows = []
         self.selected_id = None
         self.index = 0
@@ -40,6 +53,14 @@ class Preview(QWidget):
         self.text.setStyleSheet("QPlainTextEdit { background: transparent; color: #f3f4f6; font-size: 15px; }")
         self.text.viewport().installEventFilter(self)
         layout.addWidget(self.text, 1)
+        self.image = QLabel()
+        self.image.setAlignment(Qt.AlignCenter)
+        # Ignored size policy keeps large pixmaps from growing the window.
+        self.image.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.image.installEventFilter(self)
+        self.image.hide()
+        layout.addWidget(self.image, 1)
+        self.picture = None  # (entry id, decoded QImage) for the shown image
         self.counter = QLabel()
         layout.addWidget(self.counter)
         hint = QLabel("↑/↓ or J/K browse · Enter select · Delete remove · Esc close")
@@ -49,11 +70,38 @@ class Preview(QWidget):
         self.setStyleSheet("QLabel {color: #f3f4f6;} QPushButton {padding: 4px 8px;}")
         self.refresh([])
 
+    def panel_path(self):
+        path = QPainterPath()
+        path.addRoundedRect(self.rect().adjusted(1, 1, -1, -1), RADIUS, RADIUS)
+        return path
+
+    def set_blur(self, enabled):
+        self.blur_background = enabled
+        self.apply_blur()
+
+    def apply_blur(self):
+        # Blur only inside the rounded panel so the corners stay clear.
+        # Without compositor support this does nothing and the plain
+        # translucent panel is shown, as before.
+        handle = self.windowHandle()
+        if handle is None:
+            return False
+        region = QRegion(self.panel_path().toFillPolygon().toPolygon())
+        return blur.set_blur(handle, self.blur_background, region)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.apply_blur()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.blur_background and self.isVisible():
+            self.apply_blur()
+
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        path = QPainterPath()
-        path.addRoundedRect(self.rect().adjusted(1, 1, -1, -1), 18, 18)
+        path = self.panel_path()
         painter.fillPath(path, QColor(24, 28, 38, round(self.opacity * 2.55)))
         painter.setPen(QColor(255, 255, 255, 48))
         painter.drawPath(path)
@@ -69,13 +117,55 @@ class Preview(QWidget):
 
     def render(self):
         if self.rows:
-            self.selected_id, text = self.rows[self.index]
-            self.text.setPlainText(text)
-            self.counter.setText(f"{self.index + 1} of {len(self.rows)} · {len(text):,} characters")
+            self.selected_id, item = self.rows[self.index]
+            position = f"{self.index + 1} of {len(self.rows)}"
+            if isinstance(item, ImageClip):
+                self.show_image(item, position)
+                return
+            self.show_text(item)
+            self.counter.setText(f"{position} · {len(item):,} characters")
         else:
             self.selected_id = None
-            self.text.setPlainText("Your clipboard history will appear here.\nCopy some text to get started.")
+            self.show_text("Your clipboard history will appear here.\nCopy some text or an image to get started.")
             self.counter.setText("History is empty")
+
+    def show_text(self, text):
+        self.image.hide()
+        self.image.clear()
+        self.picture = None
+        self.text.show()
+        self.text.setPlainText(text)
+
+    def show_image(self, item, position):
+        if self.picture is None or self.picture[0] != self.selected_id:
+            image = QImage()
+            image.loadFromData(item.load())
+            self.picture = (self.selected_id, image)
+        image = self.picture[1]
+        kind = item.mime.split("/", 1)[1].upper()
+        self.text.hide()
+        self.text.clear()
+        self.image.show()
+        if image.isNull():
+            self.image.setText("Image preview unavailable")
+            self.counter.setText(f"{position} · {kind} image · {file_size(item.size)}")
+        else:
+            self.scale_image()
+            self.counter.setText(f"{position} · {kind} image · {image.width()}×{image.height()} · {file_size(item.size)}")
+
+    def scale_image(self):
+        if not self.picture or self.picture[1].isNull():
+            return
+        image = self.picture[1]
+        ratio = self.devicePixelRatioF()
+        box = self.image.contentsRect().size() * ratio
+        if box.isEmpty():
+            return
+        if image.width() > box.width() or image.height() > box.height():
+            image = image.scaled(box, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pixmap = QPixmap.fromImage(image)
+        pixmap.setDevicePixelRatio(ratio)
+        self.image.setPixmap(pixmap)
 
     def navigate(self, amount):
         if self.rows:
@@ -111,7 +201,10 @@ class Preview(QWidget):
             super().keyPressEvent(event)
 
     def eventFilter(self, watched, event):
-        if watched == self.text.viewport():
+        image = getattr(self, "image", None)  # filters can fire during construction
+        if watched is image and event.type() == QEvent.Resize:
+            self.scale_image()
+        if watched is image or watched == self.text.viewport():
             if event.type() == QEvent.MouseButtonDblClick and event.button() == Qt.LeftButton:
                 self.choose()
                 return True
@@ -167,13 +260,23 @@ class Preferences(QDialog):
         self.opacity.setRange(15, 100)
         self.opacity.setValue(values["opacity"])
         self.layout.addRow("Background opacity", self.opacity)
+        self.blur = QCheckBox("Blur what is behind the preview")
+        self.blur.setChecked(values["blur"])
+        self.blur.setToolTip("Needs a compositor with background blur, such as KWin with its Blur effect enabled. "
+                             "Elsewhere the preview stays plainly translucent.")
+        self.layout.addRow(self.blur)
         self.auto = QCheckBox("Insert automatically when selecting an entry")
         self.auto.setChecked(values["auto_paste"])
         self.layout.addRow(self.auto)
         self.type_content = QCheckBox("Type clipboard content")
         self.type_content.setChecked(values["type_content"])
-        self.type_content.setToolTip("Use ydotool type instead of Shift+Insert. Typing depends on ydotool's keyboard-layout and character support.")
+        self.type_content.setToolTip("Use ydotool type instead of Shift+Insert. Typing depends on ydotool's keyboard-layout and character support. "
+                                     "Images are always pasted with Shift+Insert.")
         self.layout.addRow(self.type_content)
+        self.capture_images = QCheckBox("Save copied images")
+        self.capture_images.setChecked(values["capture_images"])
+        self.capture_images.setToolTip("Keep PNG, JPEG, GIF, BMP and WebP images (up to 32 MiB each) in history.")
+        self.layout.addRow(self.capture_images)
         self.delay = QSpinBox()
         self.delay.setRange(50, 3000)
         self.delay.setSuffix(" ms")
@@ -193,5 +296,6 @@ class Preferences(QDialog):
 
     def save(self):
         self.saved.emit(dict(history_limit=self.limit.value(), opacity=self.opacity.value(),
+                             blur=self.blur.isChecked(), capture_images=self.capture_images.isChecked(),
                              auto_paste=self.auto.isChecked(), type_content=self.type_content.isChecked(),
                              paste_delay=self.delay.value(), autostart=self.autostart.isChecked()))

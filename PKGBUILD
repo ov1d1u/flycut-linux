@@ -1,13 +1,14 @@
 # Build from this checkout: makepkg -si
 pkgname=flycut-linux
 pkgver=0.1.0
-pkgrel=6
+pkgrel=8
 pkgdesc='Transparent clipboard history for KDE Plasma Wayland'
 arch=('any')
 url='https://github.com/ov1d1u/flycut-linux'
 license=('MIT')
 depends=('python' 'pyside6' 'qt6-wayland' 'python-dbus' 'python-gobject'
          'wl-clipboard>=2.3.0' 'ydotool' 'xdg-desktop-portal' 'xdg-desktop-portal-kde')
+optdepends=('kwindowsystem: blur behind the preview on KDE Plasma')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 source=()
 sha256sums=()

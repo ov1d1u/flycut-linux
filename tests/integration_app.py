@@ -35,10 +35,18 @@ def main():
         commands.mkdir()
         os.environ.update(XDG_CONFIG_HOME=str(root / "config"), XDG_DATA_HOME=str(root / "data"),
                           FLYCUT_TEST_ROOT=str(root), FLYCUT_TEST_TEXT=payload,
+                          FLYCUT_TEST_IMAGE=str(root / "image.png"),
                           PATH=str(commands) + os.pathsep + os.environ["PATH"])
         scripts = {
-            "wl-paste": "import os,subprocess,sys,time\nsubprocess.run(sys.argv[4:],input=os.environ['FLYCUT_TEST_TEXT'].encode(),env=dict(os.environ,CLIPBOARD_STATE='data'),check=True)\ntime.sleep(60)\n",
-            "wl-copy": "import os,sys,pathlib\npathlib.Path(os.environ['FLYCUT_TEST_ROOT'],'copied').write_bytes(sys.stdin.buffer.read())\n",
+            # The image watcher delivers only once the test writes image.png.
+            "wl-paste": ("import os,subprocess,sys,time\n"
+                         "if sys.argv[1:]==['--list-types']: print('image/png'); sys.exit()\n"
+                         "image=os.environ['FLYCUT_TEST_IMAGE']\n"
+                         "if sys.argv[2]=='image' and not os.path.exists(image): time.sleep(60); sys.exit()\n"
+                         "data=open(image,'rb').read() if sys.argv[2]=='image' else os.environ['FLYCUT_TEST_TEXT'].encode()\n"
+                         "subprocess.run(sys.argv[4:],input=data,env=dict(os.environ,CLIPBOARD_STATE='data'),check=True)\n"
+                         "time.sleep(60)\n"),
+            "wl-copy": "import os,sys,pathlib,json\nroot=pathlib.Path(os.environ['FLYCUT_TEST_ROOT'])\n(root/'copied-args').write_text(json.dumps(sys.argv[1:]))\n(root/'copied').write_bytes(sys.stdin.buffer.read())\n",
             "ydotool": "import os,sys,pathlib,json\nroot=pathlib.Path(os.environ['FLYCUT_TEST_ROOT'])\nif sys.argv[1]=='key': (root/'keys').write_text(json.dumps(sys.argv[1:]))\nif sys.argv[1]=='type':\n (root/'typed-args').write_text(json.dumps(sys.argv[1:]))\n (root/'typed').write_bytes(sys.stdin.buffer.read())\n",
         }
         for name, script in scripts.items():
@@ -88,14 +96,32 @@ def main():
             until(app, lambda: (root / "typed").exists() and not controller.paster.busy)
             assert (root / "typed").read_bytes() == payload.encode()
             assert json.loads((root / "typed-args").read_text()) == ["type", "--key-delay", "0", "--key-hold", "0", "--file", "-", "--escape", "0"]
+            # Images: captured by the second watcher, then pasted with keys even in typing mode.
+            from PySide6.QtGui import QColor, QImage
+            from flycut_linux.storage import History, ImageClip
+            image = QImage(64, 48, QImage.Format_RGB32)
+            image.fill(QColor(30, 200, 30))
+            assert image.save(str(root / "image.png"))
+            png = (root / "image.png").read_bytes()
+            (root / "keys").unlink()
+            controller.image_watcher.stop()
+            controller.image_watcher.start()
+            until(app, lambda: isinstance(controller.history.entries()[0][1], ImageClip))
+            assert controller.history.entries()[0][1].load() == png
+            controller.show_history()
+            assert "PNG image · 64×48" in controller.preview.counter.text()
+            QTest.keyClick(controller.preview, Qt.Key_Return)
+            until(app, lambda: (root / "keys").exists() and not controller.paster.busy)
+            assert (root / "copied").read_bytes() == png
+            assert json.loads((root / "copied-args").read_text()) == ["--type", "image/png"]
             controller.pause.setChecked(True)
             controller.capture("not saved")
-            assert len(controller.history.entries()) == 1
+            assert len(controller.history.entries()) == 2
             controller.history.close()
-            from flycut_linux.storage import History
             controller.history = History()
-            assert controller.history.entries()[0][1] == payload
-            print("PASS: full app capture, exact copy/paste/type subprocesses, selection/release, IPC, settings, autostart, pause, persistence and shutdown")
+            assert controller.history.entries()[0][1].load() == png
+            assert controller.history.entries()[1][1] == payload
+            print("PASS: full app capture, text and image copy/paste/type subprocesses, selection/release, IPC, settings, autostart, pause, persistence and shutdown")
         finally:
             if controller:
                 controller.shutdown()

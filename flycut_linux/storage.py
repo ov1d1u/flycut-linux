@@ -1,4 +1,5 @@
 """Private, bounded local history and settings."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -6,8 +7,38 @@ import sqlite3
 import tempfile
 
 MAX_BYTES = 1024 * 1024
+MAX_IMAGE_BYTES = 32 * 1024 * 1024
+# Total size of saved images; the oldest images are dropped beyond this.
+IMAGE_BUDGET = 256 * 1024 * 1024
+IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/bmp", "image/webp")
 DEFAULTS = dict(history_limit=100, opacity=82, auto_paste=True, paste_delay=150,
-                type_content=False, autostart=False)
+                type_content=False, autostart=False, blur=True, capture_images=True)
+SCHEMA = 1
+
+
+class ImageClip:
+    """An image entry. Bytes are read on demand so history stays small in memory."""
+    __slots__ = ("mime", "size", "_load")
+
+    def __init__(self, mime, size, load):
+        self.mime = mime
+        self.size = size
+        self._load = load
+
+    @classmethod
+    def of(cls, mime, data):
+        data = bytes(data)
+        return cls(mime, len(data), lambda: data)
+
+    def load(self):
+        return self._load()
+
+    def __repr__(self):
+        return f"ImageClip({self.mime!r}, {self.size} bytes)"
+
+
+def digest(kind, data):
+    return hashlib.sha256(kind.encode() + b"\0" + data).hexdigest()
 
 
 def xdg_path(variable, fallback):
@@ -75,22 +106,68 @@ class History:
         path.chmod(0o600)
         self.db = sqlite3.connect(path)
         self.db.execute("PRAGMA secure_delete=ON")
-        self.db.execute("CREATE TABLE IF NOT EXISTS entries (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL UNIQUE, position INTEGER NOT NULL)")
+        self._migrate()
         self.set_limit(limit)
 
-    def entries(self):
-        return self.db.execute("SELECT id, text FROM entries ORDER BY position DESC").fetchall()
-
-    def add(self, text):
-        if not text or len(text.encode("utf-8")) > MAX_BYTES or "\x00" in text:
-            return False
+    def _migrate(self):
+        if self.db.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA:
+            return
         with self.db:
-            self.db.execute("INSERT INTO entries(text, position) VALUES (?, (SELECT COALESCE(MAX(position), 0) + 1 FROM entries)) ON CONFLICT(text) DO UPDATE SET position=excluded.position", (text,))
+            self.db.execute("CREATE TABLE IF NOT EXISTS entries_v1 (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                            "kind TEXT NOT NULL, text TEXT, data BLOB, size INTEGER NOT NULL, "
+                            "digest TEXT NOT NULL UNIQUE, position INTEGER NOT NULL)")
+            old = self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='entries'").fetchone()
+            if old:
+                # Version 0 stored text only, in a single unique column.
+                for entry_id, text, position in self.db.execute("SELECT id, text, position FROM entries").fetchall():
+                    data = text.encode("utf-8")
+                    self.db.execute("INSERT OR IGNORE INTO entries_v1(id, kind, text, size, digest, position) "
+                                    "VALUES (?, 'text', ?, ?, ?, ?)",
+                                    (entry_id, text, len(data), digest("text", data), position))
+                self.db.execute("DROP TABLE entries")
+            self.db.execute("ALTER TABLE entries_v1 RENAME TO entries")
+            self.db.execute(f"PRAGMA user_version={SCHEMA}")
+
+    def entries(self):
+        rows = self.db.execute("SELECT id, kind, text, size FROM entries ORDER BY position DESC").fetchall()
+        return [(entry_id, text if kind == "text" else
+                 ImageClip(kind, size, lambda entry_id=entry_id: self.image_data(entry_id)))
+                for entry_id, kind, text, size in rows]
+
+    def image_data(self, entry_id):
+        row = self.db.execute("SELECT data FROM entries WHERE id=? AND kind != 'text'", (entry_id,)).fetchone()
+        return bytes(row[0]) if row else b""
+
+    def add(self, item):
+        if isinstance(item, ImageClip):
+            data = item.load()
+            if not data or len(data) > MAX_IMAGE_BYTES or item.mime not in IMAGE_TYPES:
+                return False
+            kind, text, blob = item.mime, None, data
+        else:
+            if not item or "\x00" in item:
+                return False
+            data = item.encode("utf-8")
+            if len(data) > MAX_BYTES:
+                return False
+            kind, text, blob = "text", item, None
+        key = digest("image" if blob is not None else "text", data)
+        with self.db:
+            self.db.execute("INSERT INTO entries(kind, text, data, size, digest, position) VALUES "
+                            "(?, ?, ?, ?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM entries)) "
+                            "ON CONFLICT(digest) DO UPDATE SET position=excluded.position",
+                            (kind, text, blob, len(data), key))
             self._trim()
         return True
 
     def _trim(self):
         self.db.execute("DELETE FROM entries WHERE id NOT IN (SELECT id FROM entries ORDER BY position DESC LIMIT ?)", (self.limit,))
+        total = 0
+        for entry_id, size in self.db.execute("SELECT id, size FROM entries WHERE kind != 'text' "
+                                              "ORDER BY position DESC").fetchall():
+            total += size
+            if total > IMAGE_BUDGET:
+                self.db.execute("DELETE FROM entries WHERE id=?", (entry_id,))
 
     def set_limit(self, limit):
         self.limit = max(1, min(10000, int(limit)))
