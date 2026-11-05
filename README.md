@@ -9,6 +9,14 @@ macOS clipboard manager (itself based on
 [Jumpcut](https://github.com/snark/jumpcut)). It is a separate Python/Qt
 application written for Wayland and shares no code with the macOS app.
 
+### Disclaimer
+
+This is completely AI code slop. I wanted a Flycut-like clipboard manager for my Linux box,
+but not enough to care too much to build one. Now that AI tools got more capable,
+I just asked an LLM to build one for me. I never checked the generated code,
+it seems to work fine, but I didn't reviewed the code. If you find this project
+and want to use it, you do it on your own responsibility.
+
 ## Project layout
 
 | Path | Contents |
